@@ -1,0 +1,246 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, regularizers, callbacks
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             roc_auc_score, roc_curve, ConfusionMatrixDisplay)
+
+# ════════════════════════════════════════════════════════
+# 1. ВЧИТУВАЊЕ НА ПОДАТОЦИТЕ
+# ════════════════════════════════════════════════════════
+url = "https://storage.googleapis.com/download.tensorflow.org/data/ecg.csv"
+df = pd.read_csv(url, header=None)
+
+raw_data = df.values
+labels   = raw_data[:, -1]
+data     = raw_data[:, 0:-1]
+
+# ════════════════════════════════════════════════════════
+# 2. НОРМАЛИЗАЦИЈА — ПОПРАВКА: fit САМО на train
+#    Претходно: scaler.fit_transform(data) → data leakage
+#    Сега:      fit на train, transform на двете
+# ════════════════════════════════════════════════════════
+train_data_raw = data[labels == 1]
+test_data_raw  = data[labels == 0]
+
+scaler     = MinMaxScaler(feature_range=(0, 1))
+train_data = scaler.fit_transform(train_data_raw)   # fit+transform само на train
+test_data  = scaler.transform(test_data_raw)         # само transform на test
+
+print(f"✅ Тренинг примери (нормални): {len(train_data)}")
+print(f"✅ Тест примери   (аномални):  {len(test_data)}")
+
+
+# ════════════════════════════════════════════════════════
+# 3. ДЕФИНИЦИЈА НА МОДЕЛОТ
+# ════════════════════════════════════════════════════════
+class ImprovedAutoencoder(tf.keras.Model):
+    def __init__(self):
+        super(ImprovedAutoencoder, self).__init__()
+        self.encoder = tf.keras.Sequential([
+            layers.Dense(128, activation='relu',
+                         kernel_regularizer=regularizers.l2(1e-3)),
+            layers.Dropout(0.2),
+            layers.Dense(64, activation='relu',
+                         kernel_regularizer=regularizers.l2(1e-3)),
+            layers.Dropout(0.2),
+            layers.Dense(32, activation='relu'),
+            layers.Dense(16, activation='relu')
+        ])
+        self.decoder = tf.keras.Sequential([
+            layers.Dense(32, activation='relu'),
+            layers.Dense(64, activation='relu'),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(data.shape[1], activation='sigmoid')
+        ])
+
+    def call(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+
+# ════════════════════════════════════════════════════════
+# 4. ТРЕНИРАЊЕ СО EARLY STOPPING + VALIDATION SPLIT
+#    ПОПРАВКА 1: EarlyStopping — спречува overfitting
+#    ПОПРАВКА 2: validation_split=0.1 на train_data
+#                (наместо test_data за validation)
+# ════════════════════════════════════════════════════════
+autoencoder = ImprovedAutoencoder()
+autoencoder.compile(optimizer='adam', loss='mae')
+
+early_stop = callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=10,          # стоп ако val_loss не се подобрува 10 епохи
+    restore_best_weights=True,
+    verbose=1
+)
+
+history = autoencoder.fit(
+    train_data, train_data,
+    epochs=150,
+    batch_size=256,
+    validation_split=0.1,   # 10% од нормалните за валидација
+    callbacks=[early_stop],
+    verbose=1
+)
+
+best_epoch = len(history.history['loss'])
+print(f"\n✅ Тренирањето застана на епоха {best_epoch} (best weights restored)")
+autoencoder.save('improved_heart_autoencoder.h5')
+print("✅ Моделот е зачуван!")
+
+
+# ════════════════════════════════════════════════════════
+# 5. LEARNING CURVE
+#    ПОПРАВКА: прикажи train vs val загуба по епохи
+# ════════════════════════════════════════════════════════
+plt.figure(figsize=(10, 4))
+plt.plot(history.history['loss'],     label='Train загуба',      color='steelblue')
+plt.plot(history.history['val_loss'], label='Validation загуба', color='coral',
+         linestyle='--')
+plt.axvline(best_epoch - 1, color='green', linestyle=':', label=f'Best epoch ({best_epoch})')
+plt.xlabel('Епоха')
+plt.ylabel('MAE загуба')
+plt.title('Learning curve — train vs validation')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ════════════════════════════════════════════════════════
+# 6. ПРАГ — пресметан врз НОРМАЛНИ податоци
+#    ПОПРАВКА: threshold од train грешки (не од test)
+# ════════════════════════════════════════════════════════
+train_recon = autoencoder.predict(train_data, verbose=0)
+train_mae   = np.mean(np.abs(train_recon - train_data), axis=1)
+
+# Два прага за споредба
+threshold_pct   = np.percentile(train_mae, 95)
+threshold_sigma = train_mae.mean() + 3 * train_mae.std()
+
+print(f"\n🎯 Праг (95-ти перцентил):  {threshold_pct:.4f}")
+print(f"🎯 Праг (mean + 3×std):     {threshold_sigma:.4f}")
+
+# Избери поконзервативниот (помал → помалку false negatives)
+threshold_mse = min(threshold_pct, threshold_sigma)
+print(f"✅ Користен праг:            {threshold_mse:.4f}")
+
+
+# ════════════════════════════════════════════════════════
+# 7. ДЕТЕКЦИЈА НА НАГЛИ ПРОМЕНИ
+# ════════════════════════════════════════════════════════
+def detect_sudden_changes(signal, threshold=0.3):
+    diff = np.abs(np.diff(signal))
+    return np.where(diff > threshold)[0]
+
+
+# ════════════════════════════════════════════════════════
+# 8. ПРЕДВИДУВАЊЕ НА ТЕСТ ПОДАТОЦИТЕ
+# ════════════════════════════════════════════════════════
+reconstructions = autoencoder.predict(test_data, verbose=0)
+mse_test        = np.mean(np.abs(reconstructions - test_data), axis=1)
+anomalies       = mse_test > threshold_mse
+
+
+# ════════════════════════════════════════════════════════
+# 9. АНАЛИЗА НА ПОВЕЌЕ ПРИМЕРОЦИ
+#    ПОПРАВКА: не само test_data[0], туку N примероци
+# ════════════════════════════════════════════════════════
+N_SAMPLES = 5
+fig, axes = plt.subplots(N_SAMPLES, 1, figsize=(14, N_SAMPLES * 3))
+
+for i in range(N_SAMPLES):
+    sample         = test_data[i]
+    sample_recon   = autoencoder.predict(sample.reshape(1, -1), verbose=0)[0]
+    sample_mae     = np.mean(np.abs(sample_recon - sample))
+    changes        = detect_sudden_changes(sample, threshold=0.3)
+    is_anomaly     = sample_mae > threshold_mse
+
+    ax = axes[i]
+    ax.plot(sample,       label='Оригинал',       color='steelblue', alpha=0.8)
+    ax.plot(sample_recon, label='Реконструкција', color='coral',
+            linestyle='--', alpha=0.8)
+    if len(changes) > 0:
+        ax.scatter(changes, sample[changes], color='red', s=30,
+                   zorder=5, label='Нагли промени')
+    status = '🚨 АНОМАЛИЈА' if is_anomaly else '✅ НОРМАЛНО'
+    ax.set_title(f'Примерок {i+1} | MAE={sample_mae:.4f} | {status}')
+    ax.set_ylabel('Амплитуда')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(alpha=0.3)
+
+axes[-1].set_xlabel('Временски чекор')
+plt.suptitle('Оригинал vs реконструкција (повеќе примероци)', y=1.01)
+plt.tight_layout()
+plt.show()
+
+
+# ════════════════════════════════════════════════════════
+# 10. РАСПРЕДЕЛБА НА ГРЕШКИ
+# ════════════════════════════════════════════════════════
+plt.figure(figsize=(10, 4))
+plt.hist(train_mae, bins=50, alpha=0.6, label='Train MAE (нормални)',
+         color='steelblue')
+plt.hist(mse_test,  bins=50, alpha=0.6, label='Test MAE (аномални)',
+         color='coral')
+plt.axvline(threshold_mse, color='red', linestyle='--',
+            label=f'Праг ({threshold_mse:.4f})')
+plt.xlabel('Средна апсолутна грешка (MAE)')
+plt.ylabel('Број на примери')
+plt.title('Распределба на грешки — нормални vs аномални')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# ════════════════════════════════════════════════════════
+# 11. CONFUSION MATRIX — визуелен приказ
+#    ПОПРАВКА: визуелна матрица наместо само текст
+# ════════════════════════════════════════════════════════
+# Комбинирај train (нормални=0) и test (аномални=1) за евалуација
+train_recon_eval = autoencoder.predict(train_data, verbose=0)
+train_mae_eval   = np.mean(np.abs(train_recon_eval - train_data), axis=1)
+train_preds      = (train_mae_eval > threshold_mse).astype(int)
+
+all_true  = np.concatenate([np.zeros(len(train_data)),  np.ones(len(test_data))])
+all_preds = np.concatenate([train_preds,                 anomalies.astype(int)])
+all_scores= np.concatenate([train_mae_eval,              mse_test])
+
+cm = confusion_matrix(all_true, all_preds)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+disp = ConfusionMatrixDisplay(confusion_matrix=cm,
+                              display_labels=["Нормално", "Аномалија"])
+disp.plot(ax=axes[0], colorbar=False, cmap='Blues')
+axes[0].set_title('Confusion matrix')
+
+# ROC крива
+fpr, tpr, _ = roc_curve(all_true, all_scores)
+auc_score   = roc_auc_score(all_true, all_scores)
+axes[1].plot(fpr, tpr, color='steelblue', lw=2,
+             label=f'ROC крива (AUC = {auc_score:.3f})')
+axes[1].plot([0, 1], [0, 1], 'k--', alpha=0.4, label='Случаен класификатор')
+axes[1].set_xlabel('False Positive Rate')
+axes[1].set_ylabel('True Positive Rate')
+axes[1].set_title('ROC крива — AUC метрика')
+axes[1].legend()
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print(f"\n📊 AUCScore: {auc_score:.4f}  (1.0 = совршено, 0.5 = случајно)")
+
+
+# ════════════════════════════════════════════════════════
+# 12. КЛАСИФИКАЦИСКИ ИЗВЕШТАЈ (ПОПРАВКА)
+# ════════════════════════════════════════════════════════
+print("\n📋 Класификациски извештај:")
+print(classification_report(all_true, all_preds,
+                             target_names=["Нормално", "Аномалија"]))

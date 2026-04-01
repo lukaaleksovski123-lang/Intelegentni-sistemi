@@ -244,3 +244,127 @@ print(f"\n📊 AUCScore: {auc_score:.4f}  (1.0 = совршено, 0.5 = слу�
 print("\n📋 Класификациски извештај:")
 print(classification_report(all_true, all_preds,
                              target_names=["Нормално", "Аномалија"]))
+
+
+#  DISPLAY -------------------------------------------------------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers
+from sklearn.preprocessing import MinMaxScaler
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+import time
+from datetime import datetime, timedelta, timezone
+
+# ════════════════════════════════════════════════════════
+# 1. ПОДГОТОВКА (Data & Model)
+# ════════════════════════════════════════════════════════
+url = "https://storage.googleapis.com/download.tensorflow.org/data/ecg.csv"
+df = pd.read_csv(url, header=None)
+raw_data = df.values
+labels, data = raw_data[:, -1], raw_data[:, 0:-1]
+test_data_raw = data[labels == 0]
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaler.fit(data) 
+test_data = scaler.transform(test_data_raw)
+
+class ImprovedAutoencoder(tf.keras.Model):
+    def __init__(self):
+        super(ImprovedAutoencoder, self).__init__()
+        self.encoder = tf.keras.Sequential([layers.Dense(128, activation='relu'), layers.Dense(16, activation='relu')])
+        self.decoder = tf.keras.Sequential([layers.Dense(128, activation='relu'), layers.Dense(140, activation='sigmoid')])
+    def call(self, x):
+        return self.decoder(self.encoder(x))
+
+autoencoder = ImprovedAutoencoder()
+autoencoder.compile(optimizer='adam', loss='mae')
+autoencoder.fit(test_data[:5], test_data[:5], epochs=1, verbose=0)
+threshold_mse = 0.045 
+
+# ════════════════════════════════════════════════════════
+# 2. ФУНКЦИЈА ЗА ЦРТАЊЕ НА СААТОТ
+# ════════════════════════════════════════════════════════
+output = widgets.Output()
+
+def draw_watch_os(mode="CLOCK", sample_idx=0):
+    with output:
+        clear_output(wait=True)
+        fig, ax = plt.subplots(figsize=(7, 7), facecolor='black')
+        ax.set_facecolor('black')
+        
+        now = datetime.now(timezone.utc) + timedelta(hours=2)
+        current_time = now.strftime("%H:%M")
+
+        # КУЌИШТЕ
+        ax.add_patch(plt.Circle((0.5, 0.5), 0.48, color='#1e272e', ec='#3498db', lw=4, zorder=1))
+        ax.add_patch(plt.Circle((0.5, 0.5), 0.45, color='black', zorder=2))
+
+        if mode == "CLOCK":
+            plt.text(0.5, 0.55, current_time, fontsize=95, ha='center', va='center', color='white', fontweight='bold', zorder=5)
+            plt.text(0.5, 0.42, now.strftime("%A, %d %B").upper(), fontsize=10, ha='center', color='#3498db', zorder=5)
+            plt.text(0.5, 0.25, "❤ NO ALERTS", color='#05c46b', fontsize=12, ha='center', fontweight='bold', zorder=5)
+            
+        elif mode == "SCAN":
+            sample = test_data[sample_idx]
+            recon = autoencoder.predict(sample.reshape(1, -1), verbose=0)[0]
+            diff = np.abs(sample - recon)
+            mae = np.mean(diff)
+            is_anomaly = mae > threshold_mse
+            
+            plt.grid(True, color='#111', lw=0.5, zorder=0)
+
+            # HEATMAP ЛИНИЈА
+            x_axis = np.linspace(0.18, 0.82, 140)
+            for i in range(len(x_axis)-1):
+                c = '#00ff00' if diff[i] < 0.06 else '#ffa502' if diff[i] < 0.12 else '#ff4757'
+                plt.plot(x_axis[i:i+2], sample[i:i+2] * 0.25 + 0.4, color=c, lw=2.5, zorder=3)
+            
+            # DIAGNOSIS BANNER
+            status_color = '#ff4757' if is_anomaly else '#2ed573'
+            diag_text = "CRITICAL ANOMALY" if mae > 0.08 else "POTENTIAL ARRHYTHMIA" if is_anomaly else "NORMAL RHYTHM"
+            
+            ax.add_patch(plt.Rectangle((0.28, 0.72), 0.44, 0.09, color=status_color, zorder=10))
+            plt.text(0.5, 0.765, diag_text, color='white', fontsize=13, ha='center', va='center', fontweight='bold', zorder=11)
+            
+            plt.text(0.5, 0.68, "Abnormal wave pattern detected." if is_anomaly else "Stable heart rhythm.", 
+                     color='white', fontsize=9, ha='center', alpha=0.8, zorder=5)
+
+            # ИНФО (Поправени позиции)
+            plt.text(0.5, 0.30, f"MAE SCORE: {mae:.4f}", color='white', fontsize=11, ha='center', fontweight='bold', zorder=5)
+            plt.text(0.5, 0.23, f"PATIENT DATABASE ID: #{sample_idx}", color='#3498db', fontsize=9, ha='center', zorder=5)
+            plt.text(0.5, 0.17, "RED ZONES = AI DETECTION MISMATCH", color='gray', fontsize=8, ha='center', alpha=0.8, zorder=5)
+
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.axis('off')
+        plt.show()
+
+# ════════════════════════════════════════════════════════
+# 3. КОНТРОЛИ (КОПЧИЊА И СЛАЈДЕР)
+# ════════════════════════════════════════════════════════
+btn_h = widgets.Button(description="⌚ WATCH FACE", layout=widgets.Layout(width='160px', height='45px'))
+btn_s = widgets.Button(description="💉 START AI SCAN", layout=widgets.Layout(width='180px', height='45px'), button_style='danger')
+slider = widgets.IntSlider(value=0, min=0, max=4000, description='ID:', layout=widgets.Layout(width='340px'))
+
+def click_h(b): draw_watch_os("CLOCK")
+def click_s(b):
+    with output:
+        clear_output(wait=True)
+        print("🧠 AI is analyzing...")
+        time.sleep(0.4)
+    draw_watch_os("SCAN", sample_idx=slider.value)
+
+btn_h.on_click(click_h)
+btn_s.on_click(click_s)
+
+# ПРИКАЗ
+display(widgets.VBox([
+    widgets.HBox([btn_h, btn_s]),
+    slider,
+    output
+]))
+
+draw_watch_os("CLOCK")
